@@ -127,6 +127,9 @@ class Sniffer:
         st = self.st(page)
         st["submit_done"] = False
         st["result"] = None
+        st["question"] = None   # 必须清：同标签页跨卷复用会残留上一卷的题目
+        st["sheet"] = None
+        st["saves"] = 0
 
 
 # ============================ 答题核心 ============================
@@ -289,40 +292,40 @@ async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t
                 for inp, ans in zip(inputs, fill_answers):
                     if attempt == 0:
                         try:
-                            await inp.click()
-                            await inp.fill(ans)
+                            await inp.click(timeout=3000)
+                            await inp.fill(ans, timeout=3000)
                         except Exception:
                             await inp.evaluate(
                                 "(el,v)=>{el.innerText=v;el.dispatchEvent(new Event('input',{bubbles:true}));}",
                                 ans)
                     else:  # 第二次尝试：真实键盘输入
                         try:
-                            await inp.click()
-                            await inp.fill("")
+                            await inp.click(timeout=3000)
+                            await inp.fill("", timeout=3000)
                             await exam_page.keyboard.type(ans, delay=30)
                         except Exception:
                             pass
                     await asyncio.sleep(0.3)
                     try:
-                        await inp.press("Enter")
+                        await inp.press("Enter", timeout=2000)
                     except Exception:
                         pass
                 # 失焦兜底
                 try:
                     title = await exam_page.query_selector(".centent-pre")
                     if title:
-                        await title.click()
+                        await title.click(timeout=1500)
                 except Exception:
                     pass
-                # 验证 saveAnswer 真的触发了
-                for _ in range(12):
+                # 验证 saveAnswer 真的触发了（2秒内）
+                for _ in range(8):
                     if st.get("saves", 0) > before:
-                        log(f"    填空已保存 ✓（{answers}）")
+                        log(f"    填空已保存 ✓（{fill_answers}）")
                         await asyncio.sleep(0.3)
                         return source
                     await asyncio.sleep(0.25)
                 log(f"    ⚠️ 填空未见保存信号（第{attempt + 1}次尝试）")
-            log("    ⚠️ 填空保存失败，依赖下轮采答案修复")
+            log("    ⚠️ 填空保存失败，答案将随提交兜底上传")
             return source
         # 没有输入框：可能未渲染/是选择式填空。落盘DOM供排查，并回退按选择题匹配
         log("    ⚠️ 填空题未见输入框，回退选项匹配（DOM已落盘）")
@@ -418,8 +421,15 @@ async def submit_exam(exam_page: Page):
 async def run_exam(exam_page: Page, sniffer: Sniffer, ai, bank, cfg, dry_run=False):
     """逐题作答 -> 提交。极速模式。"""
     await exam_page.wait_for_selector(".questionContent", timeout=20000)
+    exam_page.set_default_timeout(8000)  # 防单个动作失败干等30秒
     await asyncio.sleep(1.2)
     st = sniffer.st(exam_page)
+    # 等待本卷第一道题的新鲜捕获（恢复旧进度的卷子可能加载慢/不重发请求）
+    deadline = time.time() + 20
+    while time.time() < deadline and st["question"] is None:
+        await asyncio.sleep(0.4)
+    if st["question"] is None:
+        raise RuntimeError("未捕获到本卷题目数据（页面可能异常）")
     answered, bank_hits = set(), 0
     total = (st["sheet"] or {}).get("questionCount") or "?"
     t0 = time.time()
