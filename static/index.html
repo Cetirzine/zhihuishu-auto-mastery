@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>智慧树自动刷题控制台</title>
+<style>
+  :root {
+    --bg: #0f1419; --card: #1a2129; --card2: #212b36; --border: #2d3a47;
+    --text: #e6edf3; --muted: #8b98a5; --accent: #4da3ff; --green: #3fb950;
+    --red: #f85149; --yellow: #d29922;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font: 14px/1.6 "Microsoft YaHei", sans-serif; padding: 20px; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+  .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 16px; }
+  .chip { background: var(--card); border: 1px solid var(--border); border-radius: 20px; padding: 4px 14px; font-size: 13px; }
+  .chip b { font-weight: 600; }
+  .ok { color: var(--green); } .bad { color: var(--red); } .warn { color: var(--yellow); }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 1000px) { .grid { grid-template-columns: 1fr; } }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 15px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+  button { background: var(--accent); color: #fff; border: 0; border-radius: 6px; padding: 6px 16px; cursor: pointer; font-size: 13px; }
+  button:hover { filter: brightness(1.15); }
+  button.ghost { background: transparent; border: 1px solid var(--border); color: var(--text); }
+  button.danger { background: var(--red); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .course { background: var(--card2); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+  .course .name { font-weight: 600; font-size: 15px; }
+  .course .meta { color: var(--muted); font-size: 12px; margin: 4px 0 8px; }
+  .bar { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin: 6px 0; }
+  .bar i { display: block; height: 100%; background: var(--green); border-radius: 3px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  select, input { background: var(--bg); border: 1px solid var(--border); color: var(--text); border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  #logs { background: #0a0e12; border: 1px solid var(--border); border-radius: 8px; padding: 10px; font: 12px/1.5 Consolas, monospace; height: 420px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  .form { display: grid; grid-template-columns: 170px 1fr; gap: 10px 12px; align-items: center; }
+  .form label { color: var(--muted); font-size: 13px; }
+  .form input, .form select { width: 100%; }
+  .hint { color: var(--muted); font-size: 11px; }
+  .running { animation: pulse 1.5s infinite; }
+  @keyframes pulse { 50% { opacity: .55; } }
+</style>
+</head>
+<body>
+<h1>🎓 智慧树自动刷题控制台</h1>
+<div class="sub">AI 智慧课程 · 掌握度自动刷到 100% · 题库越刷越准</div>
+
+<div class="chips">
+  <span class="chip">登录：<b id="chip-login" class="warn">检测中…</b></span>
+  <span class="chip">运行：<b id="chip-run" class="bad">空闲</b></span>
+  <span class="chip">当前：<b id="chip-point">-</b></span>
+  <span class="chip">题库：<b id="chip-bank">0</b> 条</span>
+  <span class="chip">AI：<b id="chip-ai">-</b></span>
+  <button class="ghost" onclick="doLogin()" id="btn-login">🔑 登录智慧树</button>
+</div>
+
+<div class="grid">
+  <div>
+    <div class="card">
+      <h2>📚 我的课程 <button class="ghost" onclick="loadCourses(true)">刷新</button></h2>
+      <div id="courses"><div class="hint">正在检测课程…（首次会打开浏览器，请稍候）</div></div>
+    </div>
+    <div class="card">
+      <h2>⚙️ 设置</h2>
+      <div class="form">
+        <label>AI 供应商</label>
+        <select id="cfg-provider">
+          <option value="gemini">Gemini</option>
+          <option value="deepseek">DeepSeek</option>
+        </select>
+        <label>DeepSeek API Key</label>
+        <input id="cfg-deepseek_api_key" placeholder="sk-..." />
+        <label>Gemini API Key</label>
+        <input id="cfg-gemini_api_key" placeholder="AQ...." />
+        <label>Gemini 代理</label>
+        <input id="cfg-gemini_proxy" placeholder="http://127.0.0.1:7890" />
+        <label>目标掌握度 %</label>
+        <input id="cfg-target_mastery" type="number" />
+        <label>每题最短间隔(秒)</label>
+        <input id="cfg-min_seconds_per_question" type="number" step="0.1" />
+        <label>并发知识点数</label>
+        <select id="cfg-concurrency"><option>1</option><option>2</option><option>3</option></select>
+      </div>
+      <div class="row" style="margin-top:12px">
+        <button onclick="saveConfig()">💾 保存设置</button>
+        <button class="ghost" onclick="aiTest()">🔌 测试 AI 连通</button>
+        <span class="hint" id="cfg-msg"></span>
+      </div>
+      <div class="hint" style="margin-top:8px">Key 保存到本地 config.json；两家都填的话，一家失败自动切换另一家。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>📜 实时日志 <button class="ghost" onclick="toggleScroll()" id="btn-scroll">暂停滚动</button></h2>
+    <div id="logs"></div>
+  </div>
+</div>
+
+<script>
+let autoScroll = true;
+const $ = id => document.getElementById(id);
+
+async function j(url, opt) {
+  const r = await fetch(url, opt);
+  return r.json();
+}
+
+function toggleScroll() {
+  autoScroll = !autoScroll;
+  $('btn-scroll').textContent = autoScroll ? '暂停滚动' : '恢复滚动';
+}
+
+async function doLogin() {
+  $('cfg-msg').textContent = '';
+  await j('/api/login', {method: 'POST'});
+  $('chip-login').textContent = '等待登录…';
+  $('chip-login').className = 'warn running';
+}
+
+async function loadCourses(force) {
+  const el = $('courses');
+  if (force) el.innerHTML = '<div class="hint">检测中…</div>';
+  try {
+    const d = await j('/api/courses' + (force ? '?force=1' : ''));
+    if (!d.login) {
+      el.innerHTML = '<div class="hint">未登录 —— 点击右上角「🔑 登录智慧树」，登录后点刷新。</div>';
+      return;
+    }
+    if (!d.courses.length) {
+      el.innerHTML = '<div class="hint">未发现 AI 智慧课程（若你有其他类型课程请告知）。</div>';
+      return;
+    }
+    el.innerHTML = d.courses.map(c => `
+      <div class="course">
+        <div class="name">${esc(c.courseName)}</div>
+        <div class="meta">班课 ${c.classId} ${c.className ? '· ' + esc(c.className) : ''}</div>
+        <div class="hint">知识点 ${c.points_total} 个 · 未达标 <b class="${c.points_below_100 ? 'warn' : 'ok'}">${c.points_below_100}</b> · 平均掌握度 ${c.avg_mastery}%</div>
+        <div class="bar"><i style="width:${c.avg_mastery}%"></i></div>
+        <div class="row">
+          <button onclick='startCourse(${JSON.stringify(c)}, false)'>▶ 开始刷课</button>
+          <button class="ghost" onclick='startCourse(${JSON.stringify(c)}, true)'>预演(不提交)</button>
+          <span class="hint" id="run-${c.courseId}"></span>
+        </div>
+      </div>`).join('');
+  } catch (e) {
+    el.innerHTML = `<div class="hint bad">加载失败: ${e}</div>`;
+  }
+}
+
+function esc(s) { return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function startCourse(c, dry) {
+  const body = {courseId: c.courseId, classId: c.classId, dry_run: dry,
+                concurrency: parseInt($('cfg-concurrency').value) || 1};
+  const d = await j('/api/start', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  if (d.error) alert(d.error);
+}
+
+async function stopAll() {
+  if (!confirm('确定停止当前刷题任务？')) return;
+  await j('/api/stop', {method: 'POST'});
+}
+
+async function refreshStatus() {
+  try {
+    const s = await j('/api/status');
+    const L = $('chip-login');
+    if (s.login === true) { L.textContent = '已登录 ✓'; L.className = 'ok'; }
+    else if (s.login === false) { L.textContent = '未登录'; L.className = 'bad'; }
+    else { L.textContent = '检测中…'; L.className = 'warn'; }
+    const R = $('chip-run');
+    if (s.running) {
+      R.textContent = `运行中 · ${s.grind_course} ${s.status.points_done}/${s.status.points_total}`;
+      R.className = 'ok running';
+      const btn = document.querySelector('button.danger');
+      if (!btn) { /* 添加停止按钮 */ }
+    } else { R.textContent = '空闲'; R.className = ''; }
+    $('chip-point').textContent = s.running && s.status.point ? `${s.status.point} 第${s.status.pass}轮` : '-';
+    $('chip-bank').textContent = s.bank;
+    $('chip-ai').textContent = s.provider + (s.keys.deepseek || s.keys.gemini ? '' : '(未配Key)');
+  } catch (e) { /* 服务器重启中 */ }
+}
+
+async function refreshLogs() {
+  try {
+    const d = await j('/api/logs');
+    const el = $('logs');
+    el.textContent = d.lines.join('\n') || '（暂无日志）';
+    if (autoScroll) el.scrollTop = el.scrollHeight;
+  } catch (e) {}
+}
+
+async function loadConfig() {
+  const c = await j('/api/config');
+  $('cfg-provider').value = c.provider || 'gemini';
+  $('cfg-deepseek_api_key').value = c.deepseek_api_key_masked || c.deepseek_api_key || '';
+  $('cfg-gemini_api_key').value = c.gemini_api_key_masked || c.gemini_api_key || '';
+  $('cfg-gemini_proxy').value = c.gemini_proxy || '';
+  $('cfg-target_mastery').value = c.target_mastery ?? 100;
+  $('cfg-min_seconds_per_question').value = c.min_seconds_per_question ?? 0.4;
+  $('cfg-concurrency').value = String(c.concurrency ?? 1);
+}
+
+async function saveConfig() {
+  const body = {
+    provider: $('cfg-provider').value,
+    gemini_proxy: $('cfg-gemini_proxy').value,
+    target_mastery: parseFloat($('cfg-target_mastery').value) || 100,
+    min_seconds_per_question: parseFloat($('cfg-min_seconds_per_question').value) || 0.4,
+    concurrency: parseInt($('cfg-concurrency').value) || 1,
+  };
+  // 只有用户输入了新 key 才提交（掩码值含 … 时跳过）
+  const dk = $('cfg-deepseek_api_key').value, gk = $('cfg-gemini_api_key').value;
+  if (dk && !dk.includes('…')) body.deepseek_api_key = dk;
+  if (gk && !gk.includes('…')) body.gemini_api_key = gk;
+  await j('/api/config', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+  $('cfg-msg').textContent = '已保存 ✓';
+  setTimeout(() => $('cfg-msg').textContent = '', 2000);
+  loadConfig();
+}
+
+async function aiTest() {
+  $('cfg-msg').textContent = '测试中…';
+  const d = await j('/api/ai_test', {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                     body: JSON.stringify({provider: $('cfg-provider').value})});
+  $('cfg-msg').textContent = d.ok ? `✓ ${d.provider} 连通 (${d.seconds}s 答:${d.answer})` : `✗ ${d.error}`;
+}
+
+// 动态停止按钮（运行时出现在 chips 行）
+setInterval(() => {
+  const run = document.getElementById('chip-run');
+  const hasStop = document.getElementById('btn-stop');
+  if (run && run.classList.contains('running') && !hasStop) {
+    const b = document.createElement('button');
+    b.id = 'btn-stop'; b.className = 'danger'; b.textContent = '⏹ 停止刷题';
+    b.onclick = stopAll;
+    document.querySelector('.chips').appendChild(b);
+  } else if (hasStop && !run.classList.contains('running')) {
+    hasStop.remove();
+  }
+}, 1500);
+
+loadConfig(); loadCourses(false);
+refreshStatus(); refreshLogs();
+setInterval(refreshStatus, 2000);
+setInterval(refreshLogs, 2000);
+</script>
+</body>
+</html>

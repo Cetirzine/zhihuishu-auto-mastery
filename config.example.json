@@ -1,0 +1,17 @@
+{
+  "provider": "gemini",
+  "deepseek_api_key": "sk-你的DeepSeek_API_Key",
+  "deepseek_base_url": "https://api.deepseek.com",
+  "deepseek_model": "deepseek-flash",
+  "gemini_api_key": "你的Gemini_API_Key",
+  "gemini_model": "gemini-flash-lite-latest",
+  "gemini_proxy": "http://127.0.0.1:7890",
+  "min_passes_per_point": 1,
+  "max_passes_per_point": 8,
+  "min_seconds_per_question": 0.4,
+  "max_seconds_per_question": 1.2,
+  "answer_delay_seconds": 0.5,
+  "target_mastery": 100,
+  "max_perfect_streak": 3,
+  "ai_timeout": 25
+}

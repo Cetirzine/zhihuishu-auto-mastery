@@ -1,0 +1,23 @@
+# 敏感/个人数据（严禁入库）
+config.json
+browser_profile/
+session_data/
+probe_out/
+question_bank.json
+course_points.json
+shuati_log.txt
+session_log.txt
+
+# 开发过程文件（含个人课程ID的一次性脚本）
+probe_*.py
+inspect_*.py
+snapshot_gui.py
+test_offline.py
+
+# 第三方参考源码（遵守原项目许可，不入库）
+reference/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
