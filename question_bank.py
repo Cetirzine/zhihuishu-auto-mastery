@@ -21,6 +21,16 @@ def strip_html(html: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def option_key(html: str) -> str:
+    """选项的可比对键：有文字用文字；纯图片选项（数学公式）用图片 URL。
+    采集和作答两侧都用这个键，URL 稳定，跨试卷精确命中。"""
+    text = strip_html(html)
+    if text:
+        return text
+    m = re.search(r'src="([^"]+)"', html or "")
+    return m.group(1).strip() if m else ""
+
+
 def normalize(text: str) -> str:
     """进一步去掉空白与标点，用于模糊比对（选项匹配/指纹）。"""
     text = re.sub(r"\s+", "", text or "")

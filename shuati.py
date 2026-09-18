@@ -22,7 +22,7 @@ from pathlib import Path
 from playwright.async_api import async_playwright, Page, BrowserContext
 
 from ai_client import AI, load_config
-from question_bank import QuestionBank, strip_html, normalize
+from question_bank import QuestionBank, strip_html, normalize, option_key
 
 ROOT = Path(__file__).parent
 PROFILE = ROOT / "browser_profile"
@@ -158,22 +158,31 @@ def is_image_question(qdata) -> bool:
 
 
 def resolve_answers(qdata, png: bytes, ai: AI, bank: QuestionBank) -> tuple[list[str], str]:
-    """题库优先，未命中调 AI（图片题用已截好的题目截图走视觉模型）。"""
+    """题库优先，未命中调 AI。图片/公式选项（文本为空）走视觉模型按字母作答。"""
     qid = qdata["id"]
     qtext = strip_html(qdata.get("content") or "")
     options = [strip_html(o.get("content") or "") for o in qdata.get("optionVos") or []]
+    # 任一选项无文字（公式图片）即按视觉字母模式——混合型（部分图片部分文字）也适用
+    img_options = bool(options) and any(not t for t in options)
 
     hit = bank.lookup(qid, qtext)
     if hit:
         return hit, "题库"
 
+    if png and img_options:
+        hint = ("这道选择题的选项是数学公式图片，按 A、B、C、D 排列在截图里。"
+                "读题后只输出正确选项的字母本身（如 C 或 A,C），禁止输出公式、解释或任何其他字符。")
+        answer = ai.ask_image(png, hint)
+        return [answer], "AI-视觉"
+
     if png:
-        hint = qtext[:200] + ("；选项：" + " / ".join(options) if options else "")
+        hint = qtext[:200] + ("；选项：" + " / ".join(t for t in options if t) if options else "")
         answer = ai.ask_image(png, hint)
         return [answer], "AI-视觉"
 
     opt_text = "\n".join(f"{chr(65 + i)}. {t}" for i, t in enumerate(options) if t)
-    answer = ai.ask_text(qtext, opt_text)
+    prompt_extra = ("。只输出正确选项的字母，多个用逗号分隔" if options else "")
+    answer = ai.ask_text(qtext, opt_text + prompt_extra if prompt_extra else opt_text)
     return [answer], "AI"
 
 
@@ -204,7 +213,7 @@ async def match_option_elements(qdata, answers: list[str], page: Page):
     if not items:
         items = await page.query_selector_all(".questionContent li, .questionContent label")
 
-    option_texts = [strip_html(o.get("content") or "") for o in qdata.get("optionVos") or []]
+    option_texts = [option_key(o.get("content") or "") for o in qdata.get("optionVos") or []]
 
     def find_index(ans_n: str, used: set) -> int:
         for i, it in enumerate(option_texts):  # 精确
@@ -246,6 +255,22 @@ async def click_option(item, qtype: str):
     else:
         target = await item.query_selector("i.iconfont:not(.checkedIcon)")
     await (target or item).click()
+
+
+def _parse_option_letters(s: str) -> list[str]:
+    """解析纯字母选项答案（C / C. / 答案：C / A,C）。
+    字母间必须有分隔符，防止 FAD/TPP 这类真实词被误拆。"""
+    s = re.sub(r"^(答案|选项|正确选项)[:：\s]*", "", (s or "").strip())
+    s = re.sub(r"[.、．。:：)\]！!]+$", "", s).strip().upper()
+    if re.fullmatch(r"[A-H]([,，、;；/\s]+[A-H])*", s):
+        return re.findall(r"[A-H]", s)
+    return []
+
+
+def _latex_norm(s: str) -> str:
+    """公式串归一：去 LaTeX 指令/括号/空白/标点，只留字母数字和汉字。"""
+    s = re.sub(r"\\[a-zA-Z]+", "", s or "")
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", s).lower()
 
 
 async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t_start=None,
@@ -337,12 +362,74 @@ async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t
         except Exception:
             pass
 
+    # 字母答案（视觉按字母作答 / AI 回字母）-> 按索引直接点击，绕开文本匹配
+    letters = []
+    for a in answers:
+        letters.extend(_parse_option_letters(a))
+
+    # 公式图片选项但视觉没回字母：两级兜底（任一选项为图片即启用）
+    img_opts = bool(qdata.get("optionVos")) and any(
+        not strip_html(o.get("content") or "") for o in qdata.get("optionVos") or [])
+    if not letters and png and img_opts:
+        # 兜底1：强指令重问
+        try:
+            retry = await asyncio.to_thread(
+                ai.ask_image, png,
+                "你的上一条回答无法解析。重新回答：只输出正确选项的字母本身（如 C 或 A,C），"
+                "禁止输出公式、解释或任何其他字符。")
+            log(f"    [视觉链] 重问原始返回: {retry[:60]}")
+            letters = _parse_option_letters(retry)
+            if letters:
+                log(f"    视觉重问后得字母 {letters}")
+        except Exception as e:
+            log(f"    [视觉链] 重问异常: {type(e).__name__}")
+    if not letters and png and img_opts and answers:
+        # 兜底2：OCR 逐项读出选项字母与内容，与答案文本归一匹配定位
+        try:
+            ocr = await asyncio.to_thread(
+                ai.ask_image, png,
+                "请逐项读出这张图里每个选项的字母和完整内容，"
+                "严格按『A=内容；B=内容；C=内容；D=内容』的格式输出，不要解答题目。")
+            log(f"    [视觉链] OCR原始返回: {ocr[:100]}")
+            mapping = {}
+            for part in re.split(r"[;；\n]", ocr):
+                m = re.match(r"\s*\(?([A-Ha-h])[)．.、]?\s*[=＝:：]\s*(.+)", part.strip())
+                if m:
+                    mapping[m.group(1).upper()] = m.group(2)
+            if mapping:
+                target = _latex_norm(";".join(answers))
+                for L, content in mapping.items():
+                    c = _latex_norm(content)
+                    if c and target and (target in c or c in target):
+                        letters = [L]
+                        log(f"    OCR对读匹配: 选项{L}")
+                        break
+        except Exception as e:
+            log(f"    [视觉链] OCR异常: {type(e).__name__}")
+
+    if letters and qdata.get("optionVos"):
+        if qtype == TYPE_MULTI or len(letters) > 1:
+            all_items = await exam_page.query_selector_all(
+                ".checkbox-views label.el-checkbox, .radio-view li.clearfix, .questionContent li")
+        else:
+            all_items = await exam_page.query_selector_all(
+                ".radio-view li.clearfix, .checkbox-views label.el-checkbox, .questionContent li")
+        picked = [all_items[ord(c) - 65] for c in letters if ord(c) - 65 < len(all_items)]
+        if picked:
+            click_type = TYPE_MULTI if len(picked) > 1 else TYPE_SINGLE
+            for it in picked:
+                await click_option(it, click_type)
+                await asyncio.sleep(0.3)
+            return source + "(字母)"
+
     items = await match_option_elements(qdata, answers, exam_page)
     if not items:
-        log(f"    ⚠️ 答案未匹配到选项: {answers}")
+        log(f"    ⚠️ 答案未匹配到选项: {str(answers)[:80]}")
         return "未匹配"
+    # 多答案一律走复选框路径（未知题型名如 4865RPA 可能实为多选）
+    click_type = TYPE_MULTI if len(items) > 1 else qtype
     for it in items:
-        await click_option(it, qtype)
+        await click_option(it, click_type)
         await asyncio.sleep(0.3)
     return source
 
@@ -466,13 +553,15 @@ async def run_exam(exam_page: Page, sniffer: Sniffer, ai, bank, cfg, dry_run=Fal
 # ============================ 采答案 & 知识点树 ============================
 
 def harvest_result(result: dict, bank: QuestionBank):
-    """结果页 -> 题库。返回 (入库数, 是否全对)。"""
+    """结果页 -> 题库。返回 (入库数, 是否全对, 是否存在死局题)。
+    死局题：提交文本与正确答案一致仍被判错（平台隐藏判分规则），文本修复无效。"""
     if result and "aiExamQuestionInfo" not in result and isinstance(result.get("data"), dict):
         result = result["data"]
-    n, all_correct = 0, True
+    n, all_correct, has_dead = 0, True, False
     for q in result.get("aiExamQuestionInfo") or []:
         qtext = strip_html(q.get("content") or "")
-        correct = [strip_html(o.get("content") or "") for o in q.get("optionDtos") or [] if o.get("isCorrect") == 1]
+        correct = [option_key(o.get("content") or "") for o in q.get("optionDtos") or [] if o.get("isCorrect") == 1]
+        correct = [c for c in correct if c]  # 图片选项的键是URL，空的丢弃
         if correct:
             bank.save(q["id"], qtext, correct, source="错题采集")
             n += 1
@@ -484,20 +573,24 @@ def harvest_result(result: dict, bank: QuestionBank):
         for ua in q.get("userAnswerDtos") or []:
             if ua.get("isCorrect") != 1:
                 all_correct = False
-                # 错题详情：定位是匹配错还是点击失败
-                ans_ids = str(ua.get("answer") or "").split(",")
-                opts = {str(o.get("id")): strip_html(o.get("content") or "")
+                ans_raw = str(ua.get("answer") or "")
+                opts = {str(o.get("id")): option_key(o.get("content") or "")
                         for o in q.get("optionDtos") or []}
-                mine = [opts.get(a, a) for a in ans_ids if a]
-                log(f"    ❌ 判错: {qtext[:38]} | 我方提交: {mine} | 正确: {correct or q.get('result')}")
-    return n, all_correct
+                mine = [opts.get(a, a) for a in re.split(r"#@#|,", ans_raw) if a]
+                correct_cmp = correct or [str(q.get("result") or "")]
+                log(f"    ❌ 判错: {qtext[:38]} | 我方提交: {mine} | 正确: {correct_cmp}")
+                # 死局检测：提交与正确文本一致仍判错
+                if mine and normalize(";".join(mine)) == normalize(";".join(correct_cmp)):
+                    has_dead = True
+                    log("    ⛔ 死局题：提交与正确答案一致仍判错（平台隐藏规则），文本修复无效")
+    return n, all_correct, has_dead
 
 
 async def goto_exam_preview_and_harvest(exam_page: Page, sniffer: Sniffer, bank):
     m = re.search(r"/point/(\d+)/(\d+)/(\d+)/(\d+)/(\d+)", exam_page.url)
     if not m:
         log("    ⚠️ 无法解析 point 页地址，跳过采集")
-        return 0, False
+        return 0, False, False
     course, paper, exam_test, point, cls = m.groups()
     st = sniffer.st(exam_page)
     st["result"] = None
@@ -511,10 +604,10 @@ async def goto_exam_preview_and_harvest(exam_page: Page, sniffer: Sniffer, bank)
         await asyncio.sleep(0.5)
     if st["result"] is None:
         log("    ⚠️ 结果页数据未捕获")
-        return 0, False
-    n, all_correct = harvest_result(st["result"], bank)
+        return 0, False, False
+    n, all_correct, has_dead = harvest_result(st["result"], bank)
     log(f"    采答案入库 {n} 题{'，本轮全对 ✓' if all_correct else '，有错题'}")
-    return n, all_correct
+    return n, all_correct, has_dead
 
 
 def parse_tree_points(tree: dict) -> list[dict]:
@@ -557,6 +650,24 @@ async def wait_captcha_gone(page: Page):
         await asyncio.sleep(3)
 
 
+async def _click_stable(page: Page, selector: str, tries: int = 3):
+    """点按钮并容忍加载遮罩/元素重挂载的竞态。"""
+    for i in range(tries):
+        try:
+            btn = await page.wait_for_selector(selector, timeout=8000)
+            # 等加载遮罩消失
+            try:
+                await page.wait_for_selector(".el-loading-mask", state="detached", timeout=4000)
+            except Exception:
+                pass
+            await btn.click(timeout=5000)
+            return True
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            await asyncio.sleep(1.0)
+
+
 async def open_exam(sniffer: Sniffer, main_page: Page, timeout=30) -> Page:
     """两跳开卷：learnPage「去提升」-> masteryHistory 页「去提升(improve-btn)」-> 考试页。
     临界区内完成，并发安全。"""
@@ -578,8 +689,7 @@ async def open_exam(sniffer: Sniffer, main_page: Page, timeout=30) -> Page:
             return None
 
         # 第一跳：去提升 -> masteryHistory（建设中/不可测的点会停在原地）
-        btn = await main_page.wait_for_selector(".simplified-mastery__action", timeout=10000)
-        await btn.click()
+        await _click_stable(main_page, ".simplified-mastery__action")
         deadline = time.time() + 15
         while time.time() < deadline:
             if "masteryHistory" in main_page.url or await find_exam():
@@ -592,8 +702,7 @@ async def open_exam(sniffer: Sniffer, main_page: Page, timeout=30) -> Page:
         if "masteryHistory" not in main_page.url:
             # 平台偶发"建设中"状态：快速失败，下一轮扫雷自动重试该点
             raise RuntimeError("开卷失败（疑似建设中/暂不可测），跳过本轮")
-        improve = await main_page.wait_for_selector(".improve-btn", timeout=10000)
-        await improve.click()
+        await _click_stable(main_page, ".improve-btn")
         deadline = time.time() + timeout
         while time.time() < deadline:
             exam = await find_exam()
@@ -625,15 +734,23 @@ async def grind_point(main_page: Page, sniffer: Sniffer, ai, bank, cfg, course, 
         return point["mastery"], 0, False
 
     target = cfg.get("target_mastery", 100)
+    # 已达标的点直接跳过，不再强制刷一遍
+    if paper.get("highMasteryScore", 0) >= target:
+        log(f"  ⏭️ 已达 {paper['highMasteryScore']}%（目标{target}%），跳过")
+        return paper["highMasteryScore"], 0, False
     max_p = cfg.get("max_passes_per_point", 8)
     min_p = cfg.get("min_passes_per_point", 1)
     max_streak = cfg.get("max_perfect_streak", 3)
-    passes, perfect_streak = 0, 0
+    passes, perfect_streak, dead_rounds = 0, 0, 0
     streak_stopped = False
 
     while (paper["highMasteryScore"] < target or passes < min_p) and passes < max_p:
         if perfect_streak >= max_streak:
             log(f"  连续{max_streak}轮全对仍未达{target}%，止损跳下一知识点")
+            streak_stopped = True
+            break
+        if dead_rounds >= 2:
+            log("  ⛔ 连续出现死局题（提交与正确一致仍判错），该点平台判分上限，止损跳下一知识点")
             streak_stopped = True
             break
         passes += 1
@@ -646,8 +763,10 @@ async def grind_point(main_page: Page, sniffer: Sniffer, ai, bank, cfg, course, 
         try:
             stats = await run_exam(exam_page, sniffer, ai, bank, cfg, dry_run)
             if not dry_run:
-                _, all_correct = await goto_exam_preview_and_harvest(exam_page, sniffer, bank)
+                _, all_correct, has_dead = await goto_exam_preview_and_harvest(
+                    exam_page, sniffer, bank)
                 perfect_streak = perfect_streak + 1 if all_correct else 0
+                dead_rounds = dead_rounds + 1 if has_dead else 0
         finally:
             if exam_page != main_page:
                 try:
