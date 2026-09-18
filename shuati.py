@@ -191,7 +191,8 @@ def _expand_answer(ans: str, qtype: str) -> list[str]:
 
 
 async def match_option_elements(qdata, answers: list[str], page: Page):
-    """答案文本 -> 当前卷面选项 DOM（精确->包含->字母兜底）。"""
+    """答案文本 -> 当前卷面选项 DOM。先整体文本匹配（防止'FAD'这类词被误拆成字母），
+    整体匹配失败才回退字母/同义词展开。"""
     qtype = q_type(qdata)
     if qtype == TYPE_MULTI:
         items = await page.query_selector_all(".checkbox-views label.el-checkbox")
@@ -201,31 +202,38 @@ async def match_option_elements(qdata, answers: list[str], page: Page):
         items = await page.query_selector_all(".questionContent li, .questionContent label")
 
     option_texts = [strip_html(o.get("content") or "") for o in qdata.get("optionVos") or []]
+
+    def find_index(ans_n: str, used: set) -> int:
+        for i, it in enumerate(option_texts):  # 精确
+            if i in used:
+                continue
+            if ans_n == normalize(it):
+                return i
+        for i, it in enumerate(option_texts):  # 包含
+            if i in used:
+                continue
+            it_n = normalize(it)
+            if it_n and ans_n and (it_n in ans_n or ans_n in it_n):
+                return i
+        return -1
+
     matched, used = [], set()
     for ans in answers:
+        # 1) 整体匹配优先（'FMN'/'FAD'/'作为溶剂'等真实选项文本）
+        best_i = find_index(normalize(ans), used)
+        if best_i != -1:
+            matched.append(items[best_i]); used.add(best_i)
+            continue
+        # 2) 整体失败 -> 字母列表/判断题同义词展开
         for unit in _expand_answer(ans, qtype):
-            ans_n = normalize(unit)
-            m = re.fullmatch(r"[A-Ha-h]", unit)
-            if m and option_texts:
+            if re.fullmatch(r"[A-Ha-h]", unit) and option_texts:
                 idx = ord(unit.upper()) - 65
                 if 0 <= idx < len(items) and idx not in used:
                     matched.append(items[idx]); used.add(idx)
                 continue
-            best_i = -1
-            for i, it in enumerate(option_texts):
-                if i in used:
-                    continue
-                if ans_n == normalize(it):
-                    best_i = i; break
-            if best_i == -1:
-                for i, it in enumerate(option_texts):
-                    if i in used:
-                        continue
-                    it_n, a_n = normalize(it), ans_n
-                    if it_n and a_n and (it_n in a_n or a_n in it_n):
-                        best_i = i; break
-            if best_i != -1 and best_i < len(items):
-                matched.append(items[best_i]); used.add(best_i)
+            ui = find_index(normalize(unit), used)
+            if ui != -1:
+                matched.append(items[ui]); used.add(ui)
     return matched
 
 
@@ -466,6 +474,12 @@ def harvest_result(result: dict, bank: QuestionBank):
         for ua in q.get("userAnswerDtos") or []:
             if ua.get("isCorrect") != 1:
                 all_correct = False
+                # 错题详情：定位是匹配错还是点击失败
+                ans_ids = str(ua.get("answer") or "").split(",")
+                opts = {str(o.get("id")): strip_html(o.get("content") or "")
+                        for o in q.get("optionDtos") or []}
+                mine = [opts.get(a, a) for a in ans_ids if a]
+                log(f"    ❌ 判错: {qtext[:38]} | 我方提交: {mine} | 正确: {correct or q.get('result')}")
     return n, all_correct
 
 
