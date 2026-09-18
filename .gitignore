@@ -8,11 +8,18 @@ course_points.json
 shuati_log.txt
 session_log.txt
 
+# 个人学习数据
+question_bank.json
+course_points.json
+*答案备忘*.md
+*备忘*.md
+
 # 开发过程文件（含个人课程ID的一次性脚本）
 probe_*.py
 inspect_*.py
 snapshot_gui.py
 test_offline.py
+export_review.py
 
 # 第三方参考源码（遵守原项目许可，不入库）
 reference/
