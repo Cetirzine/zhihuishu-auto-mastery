@@ -19,9 +19,9 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 SYSTEM_PROMPT = (
     "你是一个考试答题助手。用户给你一道题（可能有选项）。"
     "只输出最终答案本身，不要解释、不要重复题目。"
-    "选择题输出选项的完整内容文字（与题目给出的选项文字一致，多选用逗号分隔）；"
-    "判断题输出'对'或'错'；"
-    "填空题直接输出答案文本。"
+    "选择题输出选项的完整内容文字（与题目给出的选项文字一致，可多选时用逗号分隔）；"
+    "判断题输出'正确'或'错误'（若选项是'对/错'则输出'对'或'错'）；"
+    "填空题直接输出答案文本，若有多个空，按空的出现顺序用分号（；）分隔每个空的答案。"
 )
 
 
@@ -81,7 +81,7 @@ class AI:
         return other if _key_valid(key) else None
 
     # ---------- DeepSeek ----------
-    def _deepseek(self, content) -> str:
+    def _deepseek(self, content, max_tokens: int = 4096) -> str:
         cfg = self.config
         data = _post(
             cfg["deepseek_base_url"].rstrip("/") + "/chat/completions",
@@ -92,7 +92,7 @@ class AI:
                     {"role": "user", "content": content},
                 ],
                 "temperature": 0,
-                "max_tokens": 256,
+                "max_tokens": max_tokens,
             },
             {
                 "Content-Type": "application/json",
@@ -100,7 +100,14 @@ class AI:
             },
             timeout=self.timeout,
         )
-        return data["choices"][0]["message"]["content"].strip()
+        msg = data["choices"][0]["message"]
+        text = (msg.get("content") or "").strip()
+        if not text and max_tokens < 8192:
+            # 思考型模型可能把 max_tokens 全耗在推理上：提额重试一次
+            return self._deepseek(content, max_tokens=16384)
+        if not text:
+            raise RuntimeError("DeepSeek 返回空答案（思考耗尽token）")
+        return text
 
     # ---------- Gemini ----------
     def _gemini(self, prompt: str, image_png: bytes | None) -> str:
@@ -156,7 +163,11 @@ class AI:
             fb = self._fallback_provider()
             if not fb:
                 raise
-            print(f"[AI] {self.provider} 失败({type(e).__name__})，切换到 {fb}", flush=True)
+            try:
+                from shuati import log
+                log(f"    [AI] {self.provider} 失败({type(e).__name__})，切换到 {fb}")
+            except Exception:
+                print(f"[AI] {self.provider} 失败({type(e).__name__})，切换到 {fb}", flush=True)
             self.provider = fb
             return via(fb)
 

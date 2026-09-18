@@ -98,6 +98,8 @@ class Sniffer:
                 data = await resp.json()
                 if data.get("data"):
                     st["result"] = data["data"]
+            elif "/answer/saveAnswer" in url:
+                st["saves"] = st.get("saves", 0) + 1
             elif "/exam/user/submit" in url:
                 st["submit_done"] = True
         except Exception:
@@ -130,11 +132,18 @@ class Sniffer:
 # ============================ 答题核心 ============================
 
 TYPE_SINGLE, TYPE_MULTI, TYPE_JUDGE, TYPE_FILL = "single", "multiple", "judgement", "completion"
-TYPE_MAP = {"单选题": TYPE_SINGLE, "多选题": TYPE_MULTI, "判断题": TYPE_JUDGE, "填空题": TYPE_FILL}
 
 
 def q_type(qdata) -> str:
-    return TYPE_MAP.get((qdata.get("questionTypeName") or "").strip(), TYPE_SINGLE)
+    """题型前缀匹配，兼容平台的各种变体命名（如'填空客观题（自动批阅）'）。"""
+    name = (qdata.get("questionTypeName") or "").strip()
+    if "多选" in name:
+        return TYPE_MULTI
+    if "判断" in name:
+        return TYPE_JUDGE
+    if "填空" in name or "问答" in name or "简答" in name:
+        return TYPE_FILL
+    return TYPE_SINGLE
 
 
 def is_image_question(qdata) -> bool:
@@ -228,8 +237,9 @@ async def click_option(item, qtype: str):
     await (target or item).click()
 
 
-async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t_start=None) -> str:
-    """作答当前题。越快越好：仅补足最短间隔。"""
+async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t_start=None,
+                         sniffer: "Sniffer" = None) -> str:
+    """作答当前题。填空题以 saveAnswer 真正触发为准，未保存则换打字方式重试。"""
     qtype = q_type(qdata)
     png = b""
     if is_image_question(qdata):
@@ -246,10 +256,75 @@ async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t
             await asyncio.sleep(remain)
 
     if qtype == TYPE_FILL:
-        inputs = await exam_page.query_selector_all(".fillAnswer textarea, .fillAnswer input, textarea")
-        for inp, ans in zip(inputs, answers):
-            await inp.fill(ans)
-        return source
+        inputs = await exam_page.query_selector_all(
+            ".questionContent input:not([type=hidden]):not([type=radio]):not([type=checkbox]),"
+            ".questionContent textarea,"
+            ".questionContent [contenteditable=true], .questionContent [contenteditable='']"
+        )
+        if inputs:
+            st = sniffer.st(exam_page) if sniffer else {}
+            # 多空题：把答案拆分到每个空（分号/顿号优先，不足再按逗号）
+            if len(inputs) > 1:
+                flat = []
+                for a in answers:
+                    flat.extend(p.strip() for p in re.split(r"[；;、|]", a) if p.strip())
+                if len(flat) < len(inputs):
+                    flat2 = []
+                    for p in flat:
+                        flat2.extend(q.strip() for q in re.split(r"[，,]", p) if q.strip())
+                    flat = flat2
+                fill_answers = (flat + [""] * len(inputs))[:len(inputs)]
+            else:
+                fill_answers = answers[:1]
+            for attempt in range(2):
+                before = st.get("saves", 0)
+                for inp, ans in zip(inputs, fill_answers):
+                    if attempt == 0:
+                        try:
+                            await inp.click()
+                            await inp.fill(ans)
+                        except Exception:
+                            await inp.evaluate(
+                                "(el,v)=>{el.innerText=v;el.dispatchEvent(new Event('input',{bubbles:true}));}",
+                                ans)
+                    else:  # 第二次尝试：真实键盘输入
+                        try:
+                            await inp.click()
+                            await inp.fill("")
+                            await exam_page.keyboard.type(ans, delay=30)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(0.3)
+                    try:
+                        await inp.press("Enter")
+                    except Exception:
+                        pass
+                # 失焦兜底
+                try:
+                    title = await exam_page.query_selector(".centent-pre")
+                    if title:
+                        await title.click()
+                except Exception:
+                    pass
+                # 验证 saveAnswer 真的触发了
+                for _ in range(12):
+                    if st.get("saves", 0) > before:
+                        log(f"    填空已保存 ✓（{answers}）")
+                        await asyncio.sleep(0.3)
+                        return source
+                    await asyncio.sleep(0.25)
+                log(f"    ⚠️ 填空未见保存信号（第{attempt + 1}次尝试）")
+            log("    ⚠️ 填空保存失败，依赖下轮采答案修复")
+            return source
+        # 没有输入框：可能未渲染/是选择式填空。落盘DOM供排查，并回退按选择题匹配
+        log("    ⚠️ 填空题未见输入框，回退选项匹配（DOM已落盘）")
+        try:
+            html = await exam_page.evaluate(
+                "() => document.querySelector('.questionContent')?.outerHTML || ''")
+            (ROOT / "probe_out" / "fill_dom_live.html").write_text(
+                html[:8000], encoding="utf-8")
+        except Exception:
+            pass
 
     items = await match_option_elements(qdata, answers, exam_page)
     if not items:
@@ -262,28 +337,74 @@ async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t
 
 
 async def submit_exam(exam_page: Page):
-    """提交按钮在页面顶部右侧：span.reviewDone（文字「提交作业」）。"""
-    btn = await exam_page.query_selector("span.reviewDone, .right-H .reviewDone")
-    if not btn or not await btn.is_visible():
-        # 兜底：按文本模糊找
+    """提交（顶部 span.reviewDone「提交作业」），处理含'存在未作答'提示在内的确认弹窗。"""
+
+    async def find_submit():
+        btn = await exam_page.query_selector("span.reviewDone, .right-H .reviewDone")
+        if btn and await btn.is_visible():
+            return btn
         for el in await exam_page.query_selector_all("button, span, div, a"):
             txt = (await el.inner_text() or "").strip()
             if txt in ("提交作业", "提 交", "提交", "交卷") and await el.is_visible():
-                btn = el
-                break
+                return el
+        return None
+
+    async def handle_confirm():
+        """点掉确认弹窗：优先带 确定/提交/确认 字样的按钮。"""
+        try:
+            box = await exam_page.query_selector(".el-message-box")
+            if not box:
+                return
+            for b_el in await exam_page.query_selector_all(".el-message-box .el-button"):
+                t = (await b_el.inner_text() or "").strip()
+                if any(k in t for k in ("确定", "提交", "确认")):
+                    await b_el.click()
+                    return
+            primary = await exam_page.query_selector(
+                ".el-message-box__btns .el-button--primary")
+            if primary:
+                await primary.click()
+        except Exception:
+            pass
+
+    btn = await find_submit()
     if not btn:
         raise RuntimeError("找不到提交按钮")
     await btn.click()
-    await asyncio.sleep(1.2)
-    # 确认弹窗（element-ui message box）
+    for _ in range(3):  # 可能连续多级弹窗
+        await asyncio.sleep(1.5)
+        await handle_confirm()
+        if "/point/" in exam_page.url:
+            return
+    # 弹窗处理后等导航
+    for _ in range(20):
+        if "/point/" in exam_page.url:
+            return
+        await asyncio.sleep(1)
+    # 仍未跳转：重试一次点击，再不行截图留证
+    btn2 = await find_submit()
+    if btn2:
+        await btn2.click()
+        await asyncio.sleep(3)
+        await handle_confirm()
+        for _ in range(15):
+            if "/point/" in exam_page.url:
+                return
+            await asyncio.sleep(1)
     try:
-        confirm = await exam_page.wait_for_selector(
-            ".el-message-box__btns .el-button--primary", timeout=4000
+        await exam_page.screenshot(path="probe_out/submit_timeout.png")
+        dialogs = await exam_page.evaluate(
+            "() => [...document.querySelectorAll('.el-message-box,.el-dialog__wrapper,[class*=modal],[class*=dialog],[class*=confirm]')]"
+            ".filter(el => el.getBoundingClientRect().width > 0)"
+            ".map(el => ({cls: (el.className||'').toString().slice(0,100),"
+            " text: (el.innerText||'').replace(/\\s+/g,' ').slice(0,300),"
+            " buttons: [...el.querySelectorAll('button,.el-button,span')].map(b=>(b.innerText||'').trim()).filter(Boolean).slice(0,8)}))"
         )
-        if confirm:
-            await confirm.click()
+        (ROOT / "probe_out" / "submit_dialog_live.json").write_text(
+            json.dumps(dialogs, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception:
         pass
+    raise TimeoutError("提交后未跳转结果页")
 
 
 async def run_exam(exam_page: Page, sniffer: Sniffer, ai, bank, cfg, dry_run=False):
@@ -301,7 +422,8 @@ async def run_exam(exam_page: Page, sniffer: Sniffer, ai, bank, cfg, dry_run=Fal
             tq = time.time()
             qtext = strip_html(q.get("content") or "")
             log(f"    第{len(answered)}/{total}题 [{q.get('questionTypeName')}] {qtext[:36]}")
-            src = await answer_current(exam_page, q, ai, bank, cfg, dry_run, t_start=tq)
+            src = await answer_current(exam_page, q, ai, bank, cfg, dry_run,
+                                       t_start=tq, sniffer=sniffer)
             if "题库" in src:
                 bank_hits += 1
         nxt = await exam_page.query_selector(".next-topic.next-t")
@@ -431,10 +553,10 @@ async def open_exam(sniffer: Sniffer, main_page: Page, timeout=30) -> Page:
                     pass
             return None
 
-        # 第一跳：去提升 -> masteryHistory
+        # 第一跳：去提升 -> masteryHistory（建设中/不可测的点会停在原地）
         btn = await main_page.wait_for_selector(".simplified-mastery__action", timeout=10000)
         await btn.click()
-        deadline = time.time() + timeout
+        deadline = time.time() + 15
         while time.time() < deadline:
             if "masteryHistory" in main_page.url or await find_exam():
                 break
@@ -443,10 +565,9 @@ async def open_exam(sniffer: Sniffer, main_page: Page, timeout=30) -> Page:
         if exam:
             await exam.wait_for_load_state("domcontentloaded")
             return exam
-
-        # 第二跳：masteryHistory 页上真正的开卷按钮
         if "masteryHistory" not in main_page.url:
-            raise TimeoutError("点击去提升后未跳到掌握度历史页")
+            # 平台偶发"建设中"状态：快速失败，下一轮扫雷自动重试该点
+            raise RuntimeError("开卷失败（疑似建设中/暂不可测），跳过本轮")
         improve = await main_page.wait_for_selector(".improve-btn", timeout=10000)
         await improve.click()
         deadline = time.time() + timeout
