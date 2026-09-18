@@ -138,7 +138,8 @@ TYPE_SINGLE, TYPE_MULTI, TYPE_JUDGE, TYPE_FILL = "single", "multiple", "judgemen
 
 
 def q_type(qdata) -> str:
-    """题型前缀匹配，兼容平台的各种变体命名（如'填空客观题（自动批阅）'）。"""
+    """题型前缀匹配，兼容平台的各种变体命名（如'填空客观题（自动批阅）'、'8492RPA'）。
+    没有选项的题（optionVos 为空）一定是填空/作答类。"""
     name = (qdata.get("questionTypeName") or "").strip()
     if "多选" in name:
         return TYPE_MULTI
@@ -146,15 +147,20 @@ def q_type(qdata) -> str:
         return TYPE_JUDGE
     if "填空" in name or "问答" in name or "简答" in name:
         return TYPE_FILL
+    if not (qdata.get("optionVos") or []):
+        return TYPE_FILL
     return TYPE_SINGLE
 
 
 def is_image_question(qdata) -> bool:
-    if "<img" in (qdata.get("content") or ""):
+    def has_embed(html: str) -> bool:
+        return bool(re.search(r"<(img|iframe|embed|video|object)\b", html or ""))
+
+    if has_embed(qdata.get("content") or ""):
         return True
     if qdata.get("dataFileVos"):
         return True
-    return any("<img" in (o.get("content") or "") for o in qdata.get("optionVos") or [])
+    return any(has_embed(o.get("content") or "") for o in qdata.get("optionVos") or [])
 
 
 def resolve_answers(qdata, png: bytes, ai: AI, bank: QuestionBank) -> tuple[list[str], str]:
