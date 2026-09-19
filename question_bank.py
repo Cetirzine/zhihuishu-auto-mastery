@@ -22,13 +22,16 @@ def strip_html(html: str) -> str:
 
 
 def option_key(html: str) -> str:
-    """选项的可比对键：有文字用文字；纯图片选项（数学公式）用图片 URL。
-    采集和作答两侧都用这个键，URL 稳定，跨试卷精确命中。"""
+    """选项的可比对键：纯文字用文字；纯图片（数学公式）用图片URL；
+    混合型（文字+图片）用『文字|URL』组合——单用文字会碰撞（多个选项可见文本相同）。"""
     text = strip_html(html)
+    m = re.search(r'src="([^"]+)"', html or "")
+    src = m.group(1).strip() if m else ""
+    if text and src:
+        return f"{text}|{src}"
     if text:
         return text
-    m = re.search(r'src="([^"]+)"', html or "")
-    return m.group(1).strip() if m else ""
+    return src
 
 
 def normalize(text: str) -> str:

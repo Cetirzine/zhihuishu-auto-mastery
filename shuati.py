@@ -222,6 +222,15 @@ async def match_option_elements(qdata, answers: list[str], page: Page):
 
     option_texts = [option_key(o.get("content") or "") for o in qdata.get("optionVos") or []]
 
+    # 提取每个 DOM 选项里嵌入的图片 src（混合/图片选项按 src 精确定位，不依赖顺序）
+    dom_srcs = []
+    for it in items:
+        try:
+            dom_srcs.append(await it.evaluate(
+                "el => { const i = el.querySelector('img'); return i ? i.src : ''; }") or "")
+        except Exception:
+            dom_srcs.append("")
+
     def find_index(ans_n: str, used: set) -> int:
         for i, it in enumerate(option_texts):  # 精确
             if i in used:
@@ -238,12 +247,24 @@ async def match_option_elements(qdata, answers: list[str], page: Page):
 
     matched, used = [], set()
     for ans in answers:
-        # 1) 整体匹配优先（'FMN'/'FAD'/'作为溶剂'等真实选项文本）
-        best_i = find_index(normalize(ans), used)
+        best_i = -1
+        # 1) 答案里带图片URL：按 DOM 内嵌 img src 精确定位（顺序无关）
+        m = re.search(r"https?://\S+", ans or "")
+        if m:
+            url = m.group(0).rstrip("|")
+            for i, ds in enumerate(dom_srcs):
+                if i in used:
+                    continue
+                if ds and (ds == url or ds.endswith(url.split("/")[-1])):
+                    best_i = i
+                    break
+        # 2) 整体文本匹配
+        if best_i == -1:
+            best_i = find_index(normalize(ans), used)
         if best_i != -1:
             matched.append(items[best_i]); used.add(best_i)
             continue
-        # 2) 整体失败 -> 字母列表/判断题同义词展开
+        # 3) 整体失败 -> 字母列表/判断题同义词展开
         for unit in _expand_answer(ans, qtype):
             if re.fullmatch(r"[A-Ha-h]", unit) and option_texts:
                 idx = ord(unit.upper()) - 65
@@ -629,10 +650,16 @@ def harvest_result(result: dict, bank: QuestionBank):
                 mine = [opts.get(a, a) for a in re.split(r"#@#|,", ans_raw) if a]
                 correct_cmp = correct or [str(q.get("result") or "")]
                 log(f"    ❌ 判错: {qtext[:38]} | 我方提交: {mine} | 正确: {correct_cmp}")
-                # 死局检测：提交与正确文本一致仍判错
-                if mine and normalize(";".join(mine)) == normalize(";".join(correct_cmp)):
+                # 死局检测：优先比对选项ID（文本会碰撞）；无选项的填空题才比文本
+                if q.get("optionDtos"):
+                    correct_ids = {str(o.get("id")) for o in q["optionDtos"] if o.get("isCorrect") == 1}
+                    submitted_ids = {a for a in re.split(r"#@#|,", ans_raw) if a}
+                    if submitted_ids and submitted_ids == correct_ids:
+                        has_dead = True
+                        log("    ⛔ 死局题：提交与正确选项一致仍判错（平台隐藏规则），文本修复无效")
+                elif mine and normalize(";".join(mine)) == normalize(";".join(correct_cmp)):
                     has_dead = True
-                    log("    ⛔ 死局题：提交与正确答案一致仍判错（平台隐藏规则），文本修复无效")
+                    log("    ⛔ 死局题（填空文本一致仍判错）")
     return n, all_correct, has_dead
 
 
