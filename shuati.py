@@ -138,8 +138,8 @@ TYPE_SINGLE, TYPE_MULTI, TYPE_JUDGE, TYPE_FILL = "single", "multiple", "judgemen
 
 
 def q_type(qdata) -> str:
-    """题型前缀匹配，兼容平台的各种变体命名（如'填空客观题（自动批阅）'、'8492RPA'）。
-    没有选项的题（optionVos 为空）一定是填空/作答类。"""
+    """题型前缀匹配，兼容各种变体命名。
+    无选项、或选项全是空壳（无文字无图片，如8492RPA分数填空题带的假选项）→ 填空。"""
     name = (qdata.get("questionTypeName") or "").strip()
     if "多选" in name:
         return TYPE_MULTI
@@ -147,7 +147,8 @@ def q_type(qdata) -> str:
         return TYPE_JUDGE
     if "填空" in name or "问答" in name or "简答" in name:
         return TYPE_FILL
-    if not (qdata.get("optionVos") or []):
+    opts = qdata.get("optionVos") or []
+    if not opts or all(not option_key(o.get("content") or "") for o in opts):
         return TYPE_FILL
     return TYPE_SINGLE
 
@@ -368,29 +369,53 @@ async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t
         except Exception:
             pass
 
-    # 字母答案（视觉按字母作答 / AI 回字母）-> 按索引直接点击，绕开文本匹配
+    async def click_by_letters(lets: list[str]) -> bool:
+        if not lets or not qdata.get("optionVos"):
+            return False
+        if qtype == TYPE_MULTI or len(lets) > 1:
+            all_items = await exam_page.query_selector_all(
+                ".checkbox-views label.el-checkbox, .radio-view li.clearfix, .questionContent li")
+        else:
+            all_items = await exam_page.query_selector_all(
+                ".radio-view li.clearfix, .checkbox-views label.el-checkbox, .questionContent li")
+        picked = [all_items[ord(c) - 65] for c in lets if ord(c) - 65 < len(all_items)]
+        if not picked:
+            return False
+        click_type = TYPE_MULTI if len(picked) > 1 else TYPE_SINGLE
+        for it in picked:
+            await click_option(it, click_type)
+            await asyncio.sleep(0.3)
+        return True
+
+    # 1) 答案本身就是字母（视觉按字母作答 / AI 回字母）-> 按索引直接点击
     letters = []
     for a in answers:
         letters.extend(_parse_option_letters(a))
+    if letters and await click_by_letters(letters):
+        return source + "(字母)"
 
-    # 公式图片选项但视觉没回字母：两级兜底（任一选项为图片即启用）
-    img_opts = bool(qdata.get("optionVos")) and any(
-        not strip_html(o.get("content") or "") for o in qdata.get("optionVos") or [])
-    if not letters and png and img_opts:
-        # 兜底1：强指令重问
+    # 2) 文本/URL键匹配 -> 点击
+    items = await match_option_elements(qdata, answers, exam_page)
+    if items:
+        click_type = TYPE_MULTI if len(items) > 1 else qtype
+        for it in items:
+            await click_option(it, click_type)
+            await asyncio.sleep(0.3)
+        return source
+
+    # 3) 匹配失败且题含图片（含混合型选项）：视觉链兜底
+    if png:
         try:
             retry = await asyncio.to_thread(
                 ai.ask_image, png,
-                "你的上一条回答无法解析。重新回答：只输出正确选项的字母本身（如 C 或 A,C），"
-                "禁止输出公式、解释或任何其他字符。")
+                "只输出这道题正确选项的字母本身（如 C 或 A,C），禁止输出公式、解释或任何其他字符。")
             log(f"    [视觉链] 重问原始返回: {retry[:60]}")
             letters = _parse_option_letters(retry)
-            if letters:
+            if letters and await click_by_letters(letters):
                 log(f"    视觉重问后得字母 {letters}")
+                return source + "(视觉兜底)"
         except Exception as e:
             log(f"    [视觉链] 重问异常: {type(e).__name__}")
-    if not letters and png and img_opts and answers:
-        # 兜底2：OCR 逐项读出选项字母与内容，与答案文本归一匹配定位
         try:
             ocr = await asyncio.to_thread(
                 ai.ask_image, png,
@@ -402,42 +427,61 @@ async def answer_current(exam_page: Page, qdata, ai, bank, cfg, dry_run=False, t
                 m = re.match(r"\s*\(?([A-Ha-h])[)．.、]?\s*[=＝:：]\s*(.+)", part.strip())
                 if m:
                     mapping[m.group(1).upper()] = m.group(2)
-            if mapping:
+            if mapping and answers:
                 target = _latex_norm(";".join(answers))
                 for L, content in mapping.items():
                     c = _latex_norm(content)
                     if c and target and (target in c or c in target):
-                        letters = [L]
-                        log(f"    OCR对读匹配: 选项{L}")
+                        if await click_by_letters([L]):
+                            log(f"    OCR对读匹配: 选项{L}")
+                            return source + "(OCR兜底)"
                         break
         except Exception as e:
             log(f"    [视觉链] OCR异常: {type(e).__name__}")
+        # 兜底3：把答案文本给模型，问哪个选项与它等价
+        if answers:
+            try:
+                ans_txt = ";".join(str(a) for a in answers)[:80]
+                pick = await asyncio.to_thread(
+                    ai.ask_image, png,
+                    f"这道题的正确答案是「{ans_txt}」。截图里的选项中哪一个的内容与它等价？"
+                    "只输出那个选项的字母本身。")
+                log(f"    [视觉链] 等价匹配原始返回: {pick[:40]}")
+                letters = _parse_option_letters(pick)
+                if letters and await click_by_letters(letters):
+                    log(f"    等价匹配点选: {letters}")
+                    return source + "(等价兜底)"
+            except Exception as e:
+                log(f"    [视觉链] 等价匹配异常: {type(e).__name__}")
+        # 兜底4：逐张下载选项图片转录（页面截图识别全失败时的终极手段）
+        try:
+            urls = []
+            for o in qdata.get("optionVos") or []:
+                m = re.search(r'src="([^"]+)"', o.get("content") or "")
+                if m:
+                    urls.append(m.group(1))
+            if len(urls) >= 2:
+                trans = await asyncio.to_thread(ai.transcribe_options, urls)
+                log(f"    [视觉链] 选项转录原始返回: {trans[:100]}")
+                mapping = {}
+                for part in re.split(r"[;；\n]", trans):
+                    m = re.match(r"\s*\(?([A-Ha-h])[)．.、]?\s*[=＝:：]\s*(.+)", part.strip())
+                    if m:
+                        mapping[m.group(1).upper()] = m.group(2)
+                if mapping and answers:
+                    target = _latex_norm(";".join(str(a) for a in answers))
+                    for L in sorted(mapping):
+                        c = _latex_norm(mapping[L])
+                        if c and target and (target in c or c in target):
+                            if await click_by_letters([L]):
+                                log(f"    选项转录匹配: 选项{L}")
+                                return source + "(转录兜底)"
+                            break
+        except Exception as e:
+            log(f"    [视觉链] 选项转录异常: {type(e).__name__}")
 
-    if letters and qdata.get("optionVos"):
-        if qtype == TYPE_MULTI or len(letters) > 1:
-            all_items = await exam_page.query_selector_all(
-                ".checkbox-views label.el-checkbox, .radio-view li.clearfix, .questionContent li")
-        else:
-            all_items = await exam_page.query_selector_all(
-                ".radio-view li.clearfix, .checkbox-views label.el-checkbox, .questionContent li")
-        picked = [all_items[ord(c) - 65] for c in letters if ord(c) - 65 < len(all_items)]
-        if picked:
-            click_type = TYPE_MULTI if len(picked) > 1 else TYPE_SINGLE
-            for it in picked:
-                await click_option(it, click_type)
-                await asyncio.sleep(0.3)
-            return source + "(字母)"
-
-    items = await match_option_elements(qdata, answers, exam_page)
-    if not items:
-        log(f"    ⚠️ 答案未匹配到选项: {str(answers)[:80]}")
-        return "未匹配"
-    # 多答案一律走复选框路径（未知题型名如 4865RPA 可能实为多选）
-    click_type = TYPE_MULTI if len(items) > 1 else qtype
-    for it in items:
-        await click_option(it, click_type)
-        await asyncio.sleep(0.3)
-    return source
+    log(f"    ⚠️ 答案未匹配到选项: {str(answers)[:80]}")
+    return "未匹配"
 
 
 async def submit_exam(exam_page: Page):

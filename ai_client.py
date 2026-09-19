@@ -80,6 +80,53 @@ class AI:
         key = self.config.get(f"{other}_api_key", "")
         return other if _key_valid(key) else None
 
+    def _chat_parts(self, parts) -> str:
+        """多模态 parts 级调用（当前供应商）。"""
+        if self.provider == "gemini":
+            # Gemini 的 parts 结构：文字 + 多张 inline 图
+            gparts = []
+            for p in parts:
+                if p["type"] == "text":
+                    gparts.append({"text": p["text"]})
+                else:
+                    url = p["image_url"]["url"]
+                    b64 = url.split(",", 1)[1] if url.startswith("data:") else ""
+                    gparts.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+            prompt = next((p["text"] for p in parts if p["type"] == "text"), "")
+            return self._gemini(prompt, b"") if len(gparts) == 1 else self._gemini_multi(prompt, gparts)
+        return self._deepseek(parts)
+
+    def _gemini_multi(self, prompt: str, gparts) -> str:
+        cfg = self.config
+        data = _post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{cfg['gemini_model']}:generateContent",
+            {"contents": [{"role": "user", "parts": gparts}],
+             "generationConfig": {"temperature": 0, "maxOutputTokens": 1024}},
+            {"Content-Type": "application/json", "x-goog-api-key": cfg["gemini_api_key"]},
+            proxy=cfg.get("gemini_proxy"), timeout=self.timeout, retries=2,
+        )
+        return "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"]).strip()
+
+    def transcribe_options(self, urls: list[str]) -> str:
+        """逐张下载选项图片并转录内容（模型只见选项无法答题）。
+        返回形如 'A=内容；B=内容…' 的文本。"""
+        import urllib.request as _u
+        opener = _u.build_opener(_u.ProxyHandler({}))  # 直连（国内CDN）
+        parts = [{"type": "text", "text":
+                  "这些图片依次是选择题的选项 A、B、C…（按顺序）。"
+                  "请按『A=内容；B=内容；C=内容…』的格式逐项转录每张图片里的内容，"
+                  "不要解题，不要输出任何其他文字。"}]
+        for u in urls:
+            try:
+                b = opener.open(_u.Request(u, headers={"User-Agent": "Mozilla/5.0"}), timeout=15).read()
+                parts.append({"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64," + base64.b64encode(b).decode("ascii")}})
+            except Exception:
+                continue
+        if len(parts) == 1:
+            raise RuntimeError("选项图片全部下载失败")
+        return _clean(self._chat_parts(parts))
+
     # ---------- DeepSeek ----------
     def _deepseek(self, content, max_tokens: int = 4096) -> str:
         cfg = self.config
